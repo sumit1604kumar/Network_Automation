@@ -1,0 +1,7 @@
+---
+
+cisco_group:
+    username: "sumit"
+    password: "cisco"
+    data:
+        ntp_server: "1.1.1.1"
