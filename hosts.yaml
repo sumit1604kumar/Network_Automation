@@ -1,0 +1,9 @@
+---
+
+R1:
+    username: "sumit"
+    password: "cisco"
+    platform: "ios"
+    hostname: "192.168.222.130"
+    groups:
+        - cisco_group
