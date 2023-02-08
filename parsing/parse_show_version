@@ -1,0 +1,26 @@
+# Need to install the module the scrapli[genie] for parsing ==> python3 -m pip install scrapli[genie]  and python3 -m pip install ipdb
+
+only works for cisco devices
+
+from nornir import InitNornir
+from nornir_scrapli.tasks import send_command
+from nornir_utils.plugins.functions import print_result
+import ipdb
+
+
+nr = InitNornir(config_file="config.yaml")
+
+def parse(task):
+    version = task.run(task=send_command, command="show int desc")
+    task.host["facts"] = version.scrapli_response.genie_parse_output()
+    #print(task.host["facts"])
+    uptime = task.host["facts"]["version"]["uptime"]
+    print(uptime)
+
+
+
+result = nr.run(task=parse)
+#print_result(result)
+#ipdb.set_trace()
+
+
