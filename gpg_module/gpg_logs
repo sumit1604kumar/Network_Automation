@@ -1,0 +1,138 @@
+(.venv) sumit@ubuntu:~/Credintials/.venv$ python3 -m pip install python-gnupg
+Collecting python-gnupg
+  Downloading python_gnupg-0.5.0-py2.py3-none-any.whl (18 kB)
+Installing collected packages: python-gnupg
+Successfully installed python-gnupg-0.5.0
+(.venv) sumit@ubuntu:~/Credintials/.venv$ gpg --gen-key
+gpg (GnuPG) 2.2.19; Copyright (C) 2019 Free Software Foundation, Inc.
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+Note: Use "gpg --full-generate-key" for a full featured key generation dialog.
+
+GnuPG needs to construct a user ID to identify your key.
+
+Real name: sumit kumar
+Email address: sumit.st.michel@gmail.com
+You selected this USER-ID:
+    "sumit kumar <sumit.st.michel@gmail.com>"
+
+Change (N)ame, (E)mail, or (O)kay/(Q)uit? O
+We need to generate a lot of random bytes. It is a good idea to perform
+some other action (type on the keyboard, move the mouse, utilize the
+disks) during the prime generation; this gives the random number
+generator a better chance to gain enough entropy.
+We need to generate a lot of random bytes. It is a good idea to perform
+some other action (type on the keyboard, move the mouse, utilize the
+disks) during the prime generation; this gives the random number
+generator a better chance to gain enough entropy.
+gpg: key 7D902D0F17137D13 marked as ultimately trusted
+gpg: directory '/home/sumit/.gnupg/openpgp-revocs.d' created
+gpg: revocation certificate stored as '/home/sumit/.gnupg/openpgp-revocs.d/384821443B7A0DFEF16E04777D902D0F17137D13.rev'
+public and secret key created and signed.
+
+pub   rsa3072 2023-02-08 [SC] [expires: 2025-02-07]
+      384821443B7A0DFEF16E04777D902D0F17137D13
+uid                      sumit kumar <sumit.st.michel@gmail.com>
+sub   rsa3072 2023-02-08 [E] [expires: 2025-02-07]
+
+(.venv) sumit@ubuntu:~/Credintials/.venv$ ls
+bin  include  lib  lib64  pyvenv.cfg  share
+(.venv) sumit@ubuntu:~/Credintials/.venv$ cd..
+cd..: command not found
+(.venv) sumit@ubuntu:~/Credintials/.venv$ cd .
+(.venv) sumit@ubuntu:~/Credintials/.venv$ cd ..
+(.venv) sumit@ubuntu:~/Credintials$ ls
+config.yaml  defaults.yaml  get_password.py  gpg.py  groups.yaml  hosts.yaml  nornir.log  nuggets.txt  sys.py
+(.venv) sumit@ubuntu:~/Credintials$ cat nuggets.txt
+DEFAULT_USERNAME=sumit
+DEFAULT_PASSWORD=cisco
+(.venv) sumit@ubuntu:~/Credintials$ gpg --symmetric -o encrypted.env.gpg nuggets.txt 
+(.venv) sumit@ubuntu:~/Credintials$ cat nuggets.txt
+DEFAULT_USERNAME=sumit
+DEFAULT_PASSWORD=cisco
+(.venv) sumit@ubuntu:~/Credintials$ cat encrypted.env.gpg 
+�       �mB��6���h�'�+�;�>�2�F��
+��H+�QoJnh�z��써�,T�f��w�сx`M$��z�b��cp�*��~��U�k�j(.venv) sumit@ubuntu:~/Credintials$ ls
+config.yaml  defaults.yaml  encrypted.env.gpg  get_password.py  gpg.py  groups.yaml  hosts.yaml  nornir.log  nuggets.txt  sys.py
+(.venv) sumit@ubuntu:~/Credintials$ rm nuggets.txt 
+(.venv) sumit@ubuntu:~/Credintials$ ls
+config.yaml  defaults.yaml  encrypted.env.gpg  get_password.py  gpg.py  groups.yaml  hosts.yaml  nornir.log  sys.py
+(.venv) sumit@ubuntu:~/Credintials$ cat encrypted.env.gpg 
+�       �mB��6���h�'�+�;�>�2�F��
+��H+�QoJnh�z��써�,T�f��w�сx`M$��z�b��cp�*��~��U�k�j(.venv) sumit@ubuntu:~/Credintials$ gpg --decrpt encrypted.env.gpg 
+gpg: invalid option "--decrpt"
+(.venv) sumit@ubuntu:~/Credintials$ gpg --decrypt encrypted.env.gpg 
+gpg: AES256 encrypted data
+gpg: encrypted with 1 passphrase
+DEFAULT_USERNAME=sumit
+DEFAULT_PASSWORD=cisco
+(.venv) sumit@ubuntu:~/Credintials$ gpg --decrypt encrypted.env.gpg 
+gpg: AES256 encrypted data
+gpg: encrypted with 1 passphrase
+DEFAULT_USERNAME=sumit
+DEFAULT_PASSWORD=cisco
+(.venv) sumit@ubuntu:~/Credintials$ echo RELOADAGENT | gpg-connect-agent
+OK
+(.venv) sumit@ubuntu:~/Credintials$ gpg --decrypt encrypted.env.gpg 
+gpg: AES256 encrypted data
+gpg: encrypted with 1 passphrase
+gpg: decryption failed: Bad session key
+(.venv) sumit@ubuntu:~/Credintials$ gpg --decrypt encrypted.env.gpg 
+gpg: AES256 encrypted data
+gpg: encrypted with 1 passphrase
+DEFAULT_USERNAME=sumit
+DEFAULT_PASSWORD=cisco
+(.venv) sumit@ubuntu:~/Credintials$ python3 gpg.py 
+Traceback (most recent call last):
+  File "gpg.py", line 6, in <module>
+    nr =InitNornir(config="config.yaml")
+  File "/home/sumit/Credintials/.venv/lib/python3.8/site-packages/nornir/init_nornir.py", line 65, in InitNornir
+    config = Config.from_dict(**kwargs)
+TypeError: from_dict() got an unexpected keyword argument 'config'
+(.venv) sumit@ubuntu:~/Credintials$ python3 gpg.py 
+Traceback (most recent call last):
+  File "gpg.py", line 8, in <module>
+    nr.inventory.defaults.username = os.username["DEFAULT_USERNAME"]
+AttributeError: module 'os' has no attribute 'username'
+(.venv) sumit@ubuntu:~/Credintials$ python3 gpg.py 
+Traceback (most recent call last):
+  File "gpg.py", line 8, in <module>
+    nr.inventory.defaults.username = os.environ["DEFAULT_USERNAME"]
+  File "/usr/lib/python3.8/os.py", line 675, in __getitem__
+    raise KeyError(key) from None
+KeyError: 'DEFAULT_USERNAME'
+(.venv) sumit@ubuntu:~/Credintials$ gpg --decrypt encrypted.env.gpg 
+gpg: AES256 encrypted data
+gpg: encrypted with 1 passphrase
+DEFAULT_USERNAME=sumit
+DEFAULT_PASSWORD=cisco
+(.venv) sumit@ubuntu:~/Credintials$ python3 gpg.py 
+Traceback (most recent call last):
+  File "gpg.py", line 8, in <module>
+    nr.inventory.defaults.username = os.environ["DEFAULT_USERNAME"]
+  File "/usr/lib/python3.8/os.py", line 675, in __getitem__
+    raise KeyError(key) from None
+KeyError: 'DEFAULT_USERNAME'
+(.venv) sumit@ubuntu:~/Credintials$ env $(gpg --decrypt encrypted.env.gpg) python3 gpg.py
+gpg: AES256 encrypted data
+gpg: encrypted with 1 passphrase
+/home/sumit/Credintials/.venv/lib/python3.8/site-packages/scrapli/helper.py:298: UserWarning: 
+
+********************************************************************************************************************** Authentication Warning! **********************************************************************************************************************
+                              scrapli will try to escalate privilege without entering a password but may fail.
+Set an 'auth_secondary' password if your device requires a password to increase privilege, otherwise ignore this message.                             
+*********************************************************************************************************************************************************************************************************************************************************************
+
+  warn(warning_message)
+credential_test*****************************************************************
+* R1 ** changed : False ********************************************************
+vvvv credential_test ** changed : False vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv INFO
+---- send_command ** changed : False ------------------------------------------- INFO
+                                                                                  Address
+Interface         IP Address               Status       Protocol           MTU    Owner
+----------------- ------------------------ ------------ -------------- ---------- -------
+Ethernet1         192.168.222.130/24       up           up                1500
+Management1       unassigned               up           up                1500
+^^^^ END credential_test ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(.venv) sumit@ubuntu:~/Credintials$ 
