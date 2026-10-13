@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+
+import ipaddress
+import json
+import re
+import shutil
+import subprocess
+from collections import defaultdict
+from datetime import datetime
+from getpass import getpass
+from pathlib import Path
+
+import yaml
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SIDE_DIR = SCRIPT_DIR.parent
+HOSTS_FILE = SIDE_DIR / "hosts.yaml"
+OUTPUT_BASE = SIDE_DIR / "outputs" / "recursive_bgp_paths"
+MAX_DEPTH = 10
+
+
+def safe_name(value):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))
+
+
+def dot_escape(value):
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def normalize_interface(value):
+    value = (value or "").strip().rstrip(",")
+    mappings = {
+        "Et": "Ethernet",
+        "Po": "Port-Channel",
+        "Vl": "Vlan",
+        "Lo": "Loopback",
+        "Ma": "Management",
+    }
+    for short, full in mappings.items():
+        if re.fullmatch(rf"{re.escape(short)}\d+(?:/\d+)*", value, re.I):
+            return re.sub(rf"^{re.escape(short)}", full, value, flags=re.I)
+    return value
+
+
+def load_hosts():
+    if not HOSTS_FILE.exists():
+        raise FileNotFoundError(f"Inventory not found: {HOSTS_FILE}")
+
+    with HOSTS_FILE.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+
+    if not isinstance(data, dict) or not data:
+        raise ValueError("hosts.yaml is empty or invalid")
+
+    hosts = {}
+    for name, details in data.items():
+        if isinstance(details, dict) and details.get("hostname"):
+            hosts[str(name).strip()] = {
+                **details,
+                "hostname": str(details["hostname"]).strip(),
+            }
+
+    if not hosts:
+        raise ValueError("No usable hosts found in hosts.yaml")
+    return hosts
+
+
+def validate_prefix(value):
+    network = ipaddress.ip_network(value.strip(), strict=False)
+    if network.version != 4:
+        raise ValueError("Only IPv4 prefixes are supported")
+    if network.prefixlen == 0:
+        raise ValueError("Default route 0.0.0.0/0 is not permitted")
+    return str(network)
+
+
+def build_inventory_indexes(hosts):
+    ip_to_name = {}
+    alias_to_name = {}
+    for name, details in hosts.items():
+        ip_to_name[details["hostname"]] = name
+        alias_to_name[name.lower()] = name
+        alias_to_name[name.split(".")[0].lower()] = name
+    return ip_to_name, alias_to_name
+
+
+def find_inventory_name(text, alias_to_name):
+    if not text:
+        return None
+
+    lowered = text.lower()
+    tokens = re.findall(r"[a-z0-9][a-z0-9._-]*", lowered)
+
+    for token in tokens:
+        token = token.rstrip(".")
+        short = token.split(".")[0]
+        if token in alias_to_name:
+            return alias_to_name[token]
+        if short in alias_to_name:
+            return alias_to_name[short]
+
+    # Handles descriptions such as TRANSIT-TO-NY4-7440-101-R02...
+    for alias, real_name in sorted(alias_to_name.items(), key=lambda item: len(item[0]), reverse=True):
+        if len(alias) >= 6 and alias in lowered:
+            return real_name
+    return None
+
+
+def parse_bgp_paths(output):
+    """Parse detailed Arista EOS 'show ip bgp PREFIX' text output."""
+    lines = output.splitlines()
+    paths = []
+    index = 0
+
+    as_path_pattern = re.compile(
+        r"(?:\d+(?:\.\d+)?|\{[^}]+\}|\([^)]*\))"
+        r"(?:\s+(?:\d+(?:\.\d+)?|\{[^}]+\}|\([^)]*\)))*$"
+    )
+    hop_pattern = re.compile(
+        r"(?P<next_hop>\d+\.\d+\.\d+\.\d+)\s+from\s+"
+        r"(?P<peer>\d+\.\d+\.\d+\.\d+)"
+        r"(?:\s+\((?P<router_id>\d+\.\d+\.\d+\.\d+)\))?"
+    )
+
+    while index < len(lines):
+        as_path = lines[index].strip()
+        if not as_path_pattern.fullmatch(as_path) or index + 1 >= len(lines):
+            index += 1
+            continue
+
+        hop_match = hop_pattern.match(lines[index + 1].strip())
+        if not hop_match:
+            index += 1
+            continue
+
+        attributes = []
+        cursor = index + 2
+        while cursor < len(lines):
+            candidate = lines[cursor].strip()
+            if not candidate:
+                cursor += 1
+                continue
+            if as_path_pattern.fullmatch(candidate) or hop_pattern.match(candidate):
+                break
+            attributes.append(candidate)
+            cursor += 1
+
+        attribute_text = " ".join(attributes)
+        lower = attribute_text.lower()
+        paths.append({
+            "as_path": as_path,
+            "next_hop": hop_match.group("next_hop"),
+            "peer": hop_match.group("peer"),
+            "router_id": hop_match.group("router_id") or "",
+            "best": bool(re.search(r"(?:^|,\s*)best(?:,|$)", lower)),
+            "ecmp": "ecmp" in lower,
+            "valid": "valid" in lower,
+            "attributes": attribute_text,
+        })
+        index = cursor
+
+    return paths
+
+
+def parse_route_lookup(output, queried_ip):
+    """Parse matched prefix, connected status, next hops, and outgoing interfaces."""
+    result = {
+        "matched_prefix": "",
+        "default_only": False,
+        "connected": False,
+        "next_hops": [],
+        "raw": output,
+    }
+
+    address = ipaddress.ip_address(queried_ip)
+    matching = []
+    for value in re.findall(r"\b\d+\.\d+\.\d+\.\d+/\d+\b", output):
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+            if address in network:
+                matching.append(network)
+        except ValueError:
+            pass
+
+    if matching:
+        selected = max(matching, key=lambda item: item.prefixlen)
+        result["matched_prefix"] = str(selected)
+        result["default_only"] = selected.prefixlen == 0
+
+    lower = output.lower()
+    result["connected"] = "directly connected" in lower or "is directly connected" in lower
+
+    # Matches: via 169.254.17.182, Ethernet12/1
+    pattern = re.compile(
+        r"\bvia\s+(?P<next_hop>\d+\.\d+\.\d+\.\d+)"
+        r"(?:,\s*(?P<interface>[A-Za-z][A-Za-z0-9./-]+))?",
+        re.I,
+    )
+
+    seen = set()
+    for match in pattern.finditer(output):
+        item = {
+            "next_hop": match.group("next_hop"),
+            "interface": normalize_interface(match.group("interface") or ""),
+        }
+        key = (item["next_hop"], item["interface"])
+        if key not in seen:
+            seen.add(key)
+            result["next_hops"].append(item)
+
+    return result
+
+
+class ConnectionManager:
+    def __init__(self, hosts, username, password):
+        self.hosts = hosts
+        self.username = username
+        self.password = password
+        self.connections = {}
+
+    def get(self, name):
+        if name not in self.connections:
+            self.connections[name] = ConnectHandler(
+                device_type="arista_eos",
+                host=self.hosts[name]["hostname"],
+                username=self.username,
+                password=self.password,
+                conn_timeout=15,
+                auth_timeout=20,
+                banner_timeout=30,
+                fast_cli=False,
+            )
+        return self.connections[name]
+
+    def close_all(self):
+        for connection in self.connections.values():
+            try:
+                connection.disconnect()
+            except Exception:
+                pass
+
+
+def get_lldp_neighbor(connection, interface, alias_to_name):
+    if not interface:
+        return None, "", ""
+
+    commands = [
+        f"show lldp neighbors {interface} detail",
+        f"show lldp neighbors interface {interface} detail",
+    ]
+    for command in commands:
+        output = connection.send_command(command, read_timeout=30)
+        if "invalid input" in output.lower():
+            continue
+
+        candidate = ""
+        for pattern in (
+            r"System Name\s*:\s*(\S+)",
+            r"Neighbor Device ID\s*:\s*(\S+)",
+            r"Chassis ID\s*:\s*(\S+)",
+        ):
+            match = re.search(pattern, output, re.I)
+            if match:
+                candidate = match.group(1)
+                break
+
+        remote_interface = ""
+        for pattern in (
+            r"Port ID\s*:\s*(\S+)",
+            r"Neighbor Port ID\s*:\s*(\S+)",
+            r"Port Description\s*:\s*(\S+)",
+        ):
+            match = re.search(pattern, output, re.I)
+            if match:
+                remote_interface = normalize_interface(match.group(1))
+                break
+
+        neighbor = find_inventory_name(candidate, alias_to_name)
+        if neighbor:
+            return neighbor, remote_interface, output
+
+    return None, "", ""
+
+
+def get_interface_description(connection, interface):
+    if not interface:
+        return ""
+
+    # Full interface output has the description on EOS and is reliable.
+    output = connection.send_command(
+        f"show interfaces {interface}",
+        read_timeout=30,
+        strip_prompt=True,
+        strip_command=True,
+    )
+    match = re.search(r"^\s*Description:\s*(.+)$", output, re.I | re.M)
+    if match:
+        return match.group(1).strip()
+
+    # Fallback to the description table.
+    output = connection.send_command(
+        f"show interfaces {interface} description",
+        read_timeout=30,
+        strip_prompt=True,
+        strip_command=True,
+    )
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return " ".join(lines[-2:]) if lines else ""
+
+
+def remote_interface_from_description(description, neighbor_name):
+    if not description:
+        return ""
+
+    # Prefer an interface token after the neighbor hostname.
+    position = description.lower().find(neighbor_name.lower()) if neighbor_name else -1
+    search_text = description[position + len(neighbor_name):] if position >= 0 else description
+    matches = re.findall(
+        r"\b(?:Ethernet|Et|Port-Channel|Po)\s*\d+(?:/\d+)*\b",
+        search_text,
+        re.I,
+    )
+    return normalize_interface(matches[-1].replace(" ", "")) if matches else ""
+
+
+def choose_forwarding_entry(route_info, bgp_next_hop):
+    entries = route_info.get("next_hops", [])
+    for entry in entries:
+        if entry.get("next_hop") == bgp_next_hop:
+            return entry
+    return entries[0] if entries else None
+
+
+def resolve_next_device(connection, bgp_path, route_info, ip_to_name, alias_to_name):
+    """
+    Physical resolution order:
+      1. route outgoing interface
+      2. LLDP
+      3. interface description
+      4. BGP router-ID / peer management mapping
+      5. forwarding/BGP next-hop inventory mapping
+    """
+    bgp_next_hop = bgp_path.get("next_hop", "")
+    router_id = bgp_path.get("router_id", "")
+    peer = bgp_path.get("peer", "")
+
+    entry = choose_forwarding_entry(route_info, bgp_next_hop)
+    local_interface = entry.get("interface", "") if entry else ""
+    forwarding_next_hop = entry.get("next_hop", bgp_next_hop) if entry else bgp_next_hop
+
+    if local_interface:
+        neighbor, remote_interface, _ = get_lldp_neighbor(
+            connection, local_interface, alias_to_name
+        )
+        if neighbor:
+            return {
+                "device": neighbor,
+                "local_interface": local_interface,
+                "remote_interface": remote_interface,
+                "resolution": "LLDP",
+                "forwarding_next_hop": forwarding_next_hop,
+                "description": "",
+            }
+
+    description = get_interface_description(connection, local_interface) if local_interface else ""
+    neighbor = find_inventory_name(description, alias_to_name)
+    if neighbor:
+        return {
+            "device": neighbor,
+            "local_interface": local_interface,
+            "remote_interface": remote_interface_from_description(description, neighbor),
+            "resolution": "interface description",
+            "forwarding_next_hop": forwarding_next_hop,
+            "description": description,
+        }
+
+    for address, method in (
+        (router_id, "BGP router ID"),
+        (peer, "BGP peer IP"),
+        (forwarding_next_hop, "forwarding next-hop inventory mapping"),
+        (bgp_next_hop, "BGP next-hop inventory mapping"),
+    ):
+        if address in ip_to_name:
+            return {
+                "device": ip_to_name[address],
+                "local_interface": local_interface,
+                "remote_interface": "",
+                "resolution": method,
+                "forwarding_next_hop": forwarding_next_hop,
+                "description": description,
+            }
+
+    return {
+        "device": None,
+        "local_interface": local_interface,
+        "remote_interface": "",
+        "resolution": "external or unresolved",
+        "forwarding_next_hop": forwarding_next_hop,
+        "description": description,
+    }
+
+
+class Topology:
+    def __init__(self):
+        self.nodes = {}
+        self.edges = []
+        self.raw_outputs = defaultdict(dict)
+
+    def add_node(self, node_id, **attributes):
+        self.nodes.setdefault(node_id, {}).update(attributes)
+
+    def add_edge(self, source, target, **attributes):
+        key = (source, target, attributes.get("path_index"), attributes.get("next_hop"))
+        for edge in self.edges:
+            existing = (edge["source"], edge["target"], edge.get("path_index"), edge.get("next_hop"))
+            if existing == key:
+                return
+        self.edges.append({"source": source, "target": target, **attributes})
+
+
+class RecursiveMapper:
+    def __init__(self, hosts, username, password, prefix):
+        self.hosts = hosts
+        self.prefix = prefix
+        self.target_ip = str(ipaddress.ip_network(prefix, strict=False).network_address)
+        self.ip_to_name, self.alias_to_name = build_inventory_indexes(hosts)
+        self.connections = ConnectionManager(hosts, username, password)
+        self.topology = Topology()
+        self.expanded = set()
+
+    def command(self, device_name, command):
+        output = self.connections.get(device_name).send_command(
+            command,
+            read_timeout=60,
+            strip_prompt=True,
+            strip_command=True,
+        )
+        self.topology.raw_outputs[device_name][command] = output
+        return output
+
+    def add_stop(self, device_name, message, status="failed"):
+        stop_id = f"stop_{safe_name(device_name)}_{safe_name(message)}"
+        self.topology.add_node(stop_id, kind="stop", label=message)
+        self.topology.add_edge(device_name, stop_id, status=status)
+
+    def trace(self, device_name, depth=0, branch=None):
+        branch = list(branch or [])
+        self.topology.add_node(
+            device_name,
+            kind="device",
+            management_ip=self.hosts[device_name]["hostname"],
+        )
+
+        if depth > MAX_DEPTH:
+            self.add_stop(device_name, "MAX DEPTH REACHED", "stopped")
+            return
+        if device_name in branch:
+            self.add_stop(device_name, "LOOP DETECTED", "loop")
+            return
+        if device_name in self.expanded:
+            return
+
+        branch.append(device_name)
+        self.expanded.add(device_name)
+
+        try:
+            bgp_output = self.command(device_name, f"show ip bgp {self.prefix}")
+            destination_route_output = self.command(device_name, f"show ip route {self.prefix}")
+        except NetmikoAuthenticationException:
+            self.add_stop(device_name, "AUTHENTICATION FAILED")
+            return
+        except NetmikoTimeoutException:
+            self.add_stop(device_name, "SSH TIMEOUT")
+            return
+        except Exception as error:
+            self.add_stop(device_name, f"COMMAND ERROR: {type(error).__name__}: {error}")
+            return
+
+        destination_route = parse_route_lookup(destination_route_output, self.target_ip)
+        if destination_route["default_only"]:
+            self.add_stop(device_name, "STOPPED: DEFAULT ROUTE ONLY", "default-only")
+            return
+
+        bgp_paths = parse_bgp_paths(bgp_output)
+        self.topology.nodes[device_name]["bgp_paths"] = bgp_paths
+        self.topology.nodes[device_name]["matched_prefix"] = destination_route["matched_prefix"]
+
+        if destination_route["connected"]:
+            target = f"destination_{safe_name(self.prefix)}"
+            self.topology.add_node(target, kind="destination", label=self.prefix)
+            self.topology.add_edge(device_name, target, status="connected")
+            return
+
+        if not bgp_paths:
+            self.add_stop(device_name, "NO BGP PATHS PARSED")
+            return
+
+        connection = self.connections.get(device_name)
+
+        for index, path in enumerate(bgp_paths, start=1):
+            try:
+                nh_route_output = self.command(device_name, f"show ip route {path['next_hop']}")
+                nh_route = parse_route_lookup(nh_route_output, path["next_hop"])
+            except Exception as error:
+                nh_route = {"matched_prefix": "", "default_only": False, "connected": False, "next_hops": []}
+                self.topology.raw_outputs[device_name][f"NEXT-HOP LOOKUP ERROR {path['next_hop']}"] = str(error)
+
+            if nh_route.get("default_only"):
+                route_for_resolution = destination_route
+            elif nh_route.get("next_hops"):
+                route_for_resolution = nh_route
+            else:
+                # Critical fallback: the destination route carries the real
+                # outgoing interface, e.g. via 169.254.17.182, Ethernet12/1.
+                route_for_resolution = destination_route
+
+            resolution = resolve_next_device(
+                connection,
+                path,
+                route_for_resolution,
+                self.ip_to_name,
+                self.alias_to_name,
+            )
+
+            common = {
+                "path_index": index,
+                "best": path["best"],
+                "ecmp": path["ecmp"],
+                "next_hop": path["next_hop"],
+                "peer": path["peer"],
+                "router_id": path["router_id"],
+                "as_path": path["as_path"],
+                "local_interface": resolution.get("local_interface", ""),
+                "remote_interface": resolution.get("remote_interface", ""),
+                "resolution": resolution.get("resolution", ""),
+                "description": resolution.get("description", ""),
+            }
+
+            if resolution["device"]:
+                next_device = resolution["device"]
+                self.topology.add_node(
+                    next_device,
+                    kind="device",
+                    management_ip=self.hosts[next_device]["hostname"],
+                )
+                self.topology.add_edge(device_name, next_device, status="internal", **common)
+                self.trace(next_device, depth + 1, branch)
+            else:
+                external = f"external_{safe_name(device_name)}_{index}_{safe_name(path['next_hop'])}"
+                label = (
+                    "EXTERNAL / UNRESOLVED\n"
+                    f"Next hop: {path['next_hop']}\n"
+                    f"Peer: {path['peer']}\n"
+                    f"Router ID: {path['router_id'] or 'N/A'}"
+                )
+                self.topology.add_node(external, kind="external", label=label)
+                self.topology.add_edge(device_name, external, status="external", **common)
+
+
+def edge_label(edge):
+    if edge.get("best"):
+        parts = ["BEST"]
+    elif edge.get("ecmp"):
+        parts = ["ECMP"]
+    else:
+        parts = ["ALTERNATE"]
+
+    for key, label in (
+        ("next_hop", "NH"),
+        ("local_interface", "OUT"),
+        ("remote_interface", "REMOTE"),
+        ("as_path", "AS"),
+        ("resolution", "VIA"),
+    ):
+        if edge.get(key):
+            parts.append(f"{label} {edge[key]}")
+    return "\n".join(parts)
+
+
+def write_dot(topology, source_device, prefix, dot_file):
+    lines = [
+        "digraph recursive_bgp_path {",
+        '  graph [rankdir=LR, bgcolor="white", pad="0.4", nodesep="0.6", ranksep="1.0"];',
+        '  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=10];',
+        '  edge [fontname="Arial", fontsize=9];',
+    ]
+
+    for node_id, data in topology.nodes.items():
+        kind = data.get("kind", "device")
+        if kind == "device":
+            label = node_id
+            if data.get("management_ip"):
+                label += f"\nMGMT {data['management_ip']}"
+            if data.get("matched_prefix"):
+                label += f"\nMATCH {data['matched_prefix']}"
+            path_lines = []
+            for number, path in enumerate(data.get("bgp_paths", []), start=1):
+                marker = "BEST" if path["best"] else ("ECMP" if path["ecmp"] else "ALT")
+                path_lines.append(f"{number}. {marker} | NH {path['next_hop']} | AS {path['as_path']}")
+            if path_lines:
+                label += "\n\nBGP PATHS\n" + "\n".join(path_lines)
+            color = "#2B6CB0" if node_id == source_device else "#4A5568"
+            fill = "#D9EAF7" if node_id == source_device else "#EDF2F7"
+            width = 3 if node_id == source_device else 2
+        elif kind == "destination":
+            label, color, fill, width = data.get("label", prefix), "#23856D", "#C6F6D5", 3
+        elif kind == "external":
+            label, color, fill, width = data.get("label", node_id), "#B7791F", "#FEFCBF", 2
+        else:
+            label, color, fill, width = data.get("label", node_id), "#C53030", "#FED7D7", 2
+
+        lines.append(
+            f'  "{dot_escape(node_id)}" [label="{dot_escape(label)}", '
+            f'fillcolor="{fill}", color="{color}", penwidth={width}];'
+        )
+
+    for edge in topology.edges:
+        if edge.get("best"):
+            color, width, style = "#16803B", 5, "bold"
+        elif edge.get("ecmp"):
+            color, width, style = "#38A169", 3, "solid"
+        elif edge.get("status") in {"failed", "loop", "default-only", "stopped"}:
+            color, width, style = "#C53030", 2, "dashed"
+        else:
+            color, width, style = "#718096", 1, "solid"
+
+        lines.append(
+            f'  "{dot_escape(edge["source"])}" -> "{dot_escape(edge["target"])}" '
+            f'[label="{dot_escape(edge_label(edge))}", color="{color}", '
+            f'penwidth={width}, style="{style}"];'
+        )
+
+    lines.append("}")
+    dot_file.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_report(topology, source, prefix, report_file):
+    with report_file.open("w", encoding="utf-8") as report:
+        report.write("=" * 100 + "\nRECURSIVE BGP PATH AND HOP REPORT\n" + "=" * 100 + "\n\n")
+        report.write(f"Collected   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        report.write(f"Source      : {source}\nDestination : {prefix}\n\n")
+
+        report.write("DISCOVERED HOPS\n" + "-" * 100 + "\n")
+        for edge in topology.edges:
+            marker = "BEST" if edge.get("best") else ("ECMP" if edge.get("ecmp") else "ALTERNATE")
+            report.write(f"{edge['source']} -> {edge['target']} [{marker}]\n")
+            for key, label in (
+                ("next_hop", "Next hop"),
+                ("local_interface", "Outgoing interface"),
+                ("remote_interface", "Remote interface"),
+                ("as_path", "AS path"),
+                ("resolution", "Resolved using"),
+                ("description", "Interface description"),
+            ):
+                if edge.get(key):
+                    report.write(f"  {label:21}: {edge[key]}\n")
+            report.write("\n")
+
+        report.write("\nBGP PATHS AT EACH DEVICE\n" + "-" * 100 + "\n")
+        for node_id, data in topology.nodes.items():
+            if data.get("kind") != "device":
+                continue
+            report.write(f"\nDEVICE: {node_id}\n")
+            for number, path in enumerate(data.get("bgp_paths", []), start=1):
+                marker = "BEST" if path["best"] else ("ECMP" if path["ecmp"] else "ALTERNATE")
+                report.write(f"  Path {number} [{marker}]\n")
+                report.write(f"    Next hop : {path['next_hop']}\n")
+                report.write(f"    Peer     : {path['peer']}\n")
+                report.write(f"    Router ID: {path['router_id'] or 'N/A'}\n")
+                report.write(f"    AS path  : {path['as_path']}\n")
+
+
+def write_raw_outputs(topology, raw_file):
+    with raw_file.open("w", encoding="utf-8") as handle:
+        for device, commands in topology.raw_outputs.items():
+            handle.write("=" * 100 + f"\nDEVICE: {device}\n" + "=" * 100 + "\n")
+            for command, output in commands.items():
+                handle.write(f"\nCOMMAND: {command}\n" + "-" * 100 + "\n")
+                handle.write(output + "\n")
+
+
+def render_png(dot_file, png_file):
+    dot = shutil.which("dot")
+    if not dot:
+        return False
+    subprocess.run([dot, "-Tpng", str(dot_file), "-o", str(png_file)], check=True)
+    return True
+
+
+def main():
+    try:
+        hosts = load_hosts()
+    except Exception as error:
+        print(f"ERROR: {error}")
+        return
+
+    print(f"\nInventory contains {len(hosts)} devices.")
+    source = input("Enter source device name: ").strip()
+    if source not in hosts:
+        print(f"ERROR: {source} not found in hosts.yaml")
+        matches = [name for name in hosts if source.lower() in name.lower()]
+        for name in matches[:20]:
+            print(f"  {name}")
+        return
+
+    try:
+        prefix = validate_prefix(input("Enter destination prefix: "))
+    except ValueError as error:
+        print(f"ERROR: {error}")
+        return
+
+    username = input("Username: ").strip()
+    password = getpass("Password: ")
+
+    mapper = RecursiveMapper(hosts, username, password, prefix)
+    try:
+        print(f"\nTracing all BGP paths from {source} to {prefix}...")
+        mapper.trace(source)
+    finally:
+        mapper.connections.close_all()
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = OUTPUT_BASE / f"{stamp}_{safe_name(source)}_{safe_name(prefix)}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    report_file = output_dir / "recursive_bgp_path_report.txt"
+    raw_file = output_dir / "raw_command_outputs.txt"
+    dot_file = output_dir / "recursive_bgp_path_diagram.dot"
+    png_file = output_dir / "recursive_bgp_path_diagram.png"
+    json_file = output_dir / "recursive_bgp_path_data.json"
+
+    write_report(mapper.topology, source, prefix, report_file)
+    write_raw_outputs(mapper.topology, raw_file)
+    write_dot(mapper.topology, source, prefix, dot_file)
+    json_file.write_text(json.dumps({
+        "source": source,
+        "prefix": prefix,
+        "nodes": mapper.topology.nodes,
+        "edges": mapper.topology.edges,
+    }, indent=2), encoding="utf-8")
+
+    png_created = render_png(dot_file, png_file)
+
+    print("\n" + "=" * 72)
+    print("TRACE COMPLETED")
+    print("=" * 72)
+    print(f"Report      : {report_file}")
+    print(f"Raw outputs : {raw_file}")
+    print(f"DOT diagram : {dot_file}")
+    print(f"JSON data   : {json_file}")
+    print(f"PNG diagram : {png_file if png_created else 'Graphviz dot unavailable'}")
+
+
+if __name__ == "__main__":
+    main()
